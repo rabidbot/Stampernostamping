@@ -4,24 +4,24 @@ import type { ThreadId } from "../types";
 export interface Regular {
   id: string;
   name: string;
-  blurb: string; // shown in the dossier
+  desc: string; // shown in the dossier
 }
 
 export const REGULARS: Record<string, Regular> = {
   marta: {
     id: "marta",
     name: "Marta Čič",
-    blurb: "A courier whose valise gets heavier, and more alive, each crossing.",
+    desc: "A courier whose valise gets heavier, and more alive, each crossing.",
   },
   iliya: {
     id: "iliya",
     name: "Iliya Teren",
-    blurb: "A hollow-eyed musician who only wants to play somewhere warm.",
+    desc: "A hollow-eyed musician who only wants to play somewhere warm.",
   },
   reck: {
     id: "reck",
     name: "Officer Reck",
-    blurb: "Internal-affairs. Grey coat, smaller at the edges.",
+    desc: "Internal-affairs. Grey coat, smaller at the edges.",
   },
 };
 

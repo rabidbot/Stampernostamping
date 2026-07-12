@@ -1,143 +1,316 @@
-// loop.ts — the core loop: intro → shift → dossier → next day.
-// Wires stamps, ink, boredom, temptation, verdict, and threads together.
+// loop.ts — the core loop, rewritten for the single 384×216 canvas renderer.
+// No DOM for visuals. Everything draws to the framebuffer.
+// Pointer events come through the canvas → grid coords.
+import { createScene, flip, pointerToGrid, type Scene } from "../render/scene";
+import * as P from "../render/pixel";
+import { FB_W, FB_H } from "../render/pixel";
+import * as RC from "../render/renderCore";
+import { LAYOUT } from "../render/renderCore";
+import { activePalette } from "../render/palette";
+import { PixelStamp, type StampKind, type StampImpactInfo, type StampTarget } from "../stamp/stamp";
+import { drawImprint, spawnSpecks, drawSpecks, tickSpecks, type Speck } from "../stamp/imprint";
+import { consumeInk, inkFraction, reInk } from "../stamp/ink";
+import { ensureAudio, playStamp } from "../stamp/stampSound";
 import { getTravelersForDay, totalDays } from "../content/travelers";
 import { resolveTraveler } from "../rulebook/resolver";
 import { getRulebook } from "../rulebook/rulebook";
 import { store } from "../state";
-import { Stamp, type StampKind, type StampTarget, imprintAt } from "../stamp/stamp";
-import { consumeInk, inkFraction, reInk } from "../stamp/ink";
-import { ensureAudio, playStamp } from "../stamp/stampSound";
-import {
-  layoutStampTargets,
-  renderDocument,
-  type RenderedDoc,
-} from "../render/documentCard";
-import { applyBoredom, type BoothRefs } from "../render/booth";
-import { renderRulebook } from "../render/rulebookView";
-import { renderHud } from "../render/hud";
 import { startAmbientBoredom } from "../game/boredom";
 import { shouldShowHook, acceptHook } from "../game/temptation";
 import { evaluateAction } from "../game/verdict";
 import { advanceForRegular, maybeOpenInternalAffairs } from "../game/threads";
-import { showDossier } from "../game/dossier";
 import { maybeTriggerScene } from "../game/transfer";
 import type { Traveler } from "../types";
 
 const INK_PER_STAMP = 9;
 
-export class Game {
-  private refs: BoothRefs;
-  private stamps: Stamp[] = [];
-  private renderedDocs: RenderedDoc[] = [];
-  private current: Traveler | null = null;
-  private hookAcceptedThisEncounter = false;
-  private prevDay = 0;
-  private stopAmbient: (() => void) | null = null;
+interface ModalState {
+  title: string;
+  body: string;
+  btn: string;
+  onConfirm: () => void;
+  // hitbox for the button (set during render, checked on click)
+  btnX: number; btnY: number; btnW: number; btnH: number;
+}
 
-  constructor(refs: BoothRefs) {
-    this.refs = refs;
+interface HookState {
+  prompt: string;
+  onAccept: () => void;
+  onRefuse: () => void;
+  acceptX: number; acceptY: number; acceptW: number; acceptH: number;
+  refuseX: number; refuseY: number; refuseW: number; refuseH: number;
+}
+
+export class Game {
+  private scene: Scene;
+  private ctx: P.PixelCtx;
+  private stamps: PixelStamp[] = [];
+  private current: Traveler | null = null;
+  private specks: Speck[] = [];
+  private shakeX = 0;
+  private shakeY = 0;
+  private shakeLife = 0;
+  private vivid01 = 0;               // transgression color-flood, decays to 0
+  private modal: ModalState | null = null;
+  private hook: HookState | null = null;
+  private hookAcceptedThisEncounter = false;
+  private flashMsg: string | null = null;
+  private flashTimer = 0;
+  private animFrame = 0;
+  private stopAmbient: (() => void) | null = null;
+  private rulebook = getRulebook(1);
+  private docSlots: RC.DocSlot[] = [];
+  private docX: number[] = [];  // doc positions
+  private docY: number[] = [];
+
+  constructor(parent: HTMLElement) {
+    this.scene = createScene(parent);
+    this.ctx = {
+      fb: this.scene.fb32,
+      packed: activePalette(0, 0),
+    };
+
+    // Create stamps
+    const stampDefs: { kind: StampKind; restX: number; restY: number }[] = [
+      { kind: "APPROVE", restX: 290, restY: 108 },
+      { kind: "DENY",   restX: 290, restY: 130 },
+      { kind: "FORGED", restX: 290, restY: 152 },
+    ];
+    for (const d of stampDefs) {
+      const s = new PixelStamp(d.kind, d.restX, d.restY);
+      s.onImpact = (info) => this.onStampImpact(info);
+      if (d.kind === "FORGED") s.visible = false;
+      this.stamps.push(s);
+    }
+
     this.stopAmbient = startAmbientBoredom();
-    store.subscribe(() => this.syncHud());
-    this.refs.pad.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      void ensureAudio().then(() => reInk());
-    });
+    store.subscribe(() => this.syncState());
+
+    // Pointer events on canvas
+    const canvas = this.scene.canvas;
+    canvas.addEventListener("pointerdown", (e) => this.onPointerDown(e));
+    canvas.addEventListener("pointermove", (e) => this.onPointerMove(e));
+    canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
+    canvas.addEventListener("pointercancel", (e) => this.onPointerUp(e));
+
+    // Start render loop
+    this.tick();
   }
 
-  /** clean teardown (stops the ambient boredom tick) */
   destroy(): void {
     this.stopAmbient?.();
-    this.stamps.forEach((s) => s.destroy());
+  }
+
+  private syncState(): void {
+    // Nothing to do here — state is read from the store in render
   }
 
   async start(): Promise<void> {
     await ensureAudio();
-    this.buildStamps();
     this.openIntro(1);
   }
 
-  private buildStamps(): void {
-    const defs: { kind: StampKind; label: string; colour: string }[] = [
-      { kind: "APPROVE", label: "APPROVE", colour: "#2f9e44" },
-      { kind: "DENY", label: "DENY", colour: "#c92a2a" },
-      { kind: "FORGED", label: "FORGE", colour: "#5f3dc4" },
-    ];
-    // FORGED stamp starts hidden — only shown once the player accepts a forgery_request
-    for (const d of defs) {
-      const s = new Stamp(d.kind, d.label, d.colour);
-      s.onImpact = (info) => this.onStampImpact(info);
-      s.mount(this.refs.root, 120, window.innerHeight - 140);
-      s.el.classList.add("stamp-rack-item");
-      if (d.kind === "FORGED") {
-        s.el.classList.add("forged");
-        s.el.style.display = "none";
+  // ============================ POINTER ============================
+
+  private onPointerDown(e: PointerEvent): void {
+    e.preventDefault();
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    const g = pointerToGrid(this.scene, e.clientX, e.clientY);
+    if (!g) return;
+
+    // Modal active → check button hitbox
+    if (this.modal) {
+      if (g.x >= this.modal.btnX && g.x < this.modal.btnX + this.modal.btnW &&
+          g.y >= this.modal.btnY && g.y < this.modal.btnY + this.modal.btnH) {
+        const m = this.modal;
+        this.modal = null;
+        m.onConfirm();
       }
-      this.stamps.push(s);
+      return;
     }
-    this.layoutStamps();
-    window.addEventListener("resize", () => this.layoutStamps());
-  }
 
-  private layoutStamps(): void {
-    const rack = this.refs.rack.getBoundingClientRect();
-    let i = 0;
+    // Hook buttons active
+    if (this.hook) {
+      if (g.x >= this.hook.acceptX && g.x < this.hook.acceptX + this.hook.acceptW &&
+          g.y >= this.hook.acceptY && g.y < this.hook.acceptY + this.hook.acceptH) {
+        const h = this.hook;
+        this.hook = null;
+        h.onAccept();
+        return;
+      }
+      if (g.x >= this.hook.refuseX && g.x < this.hook.refuseX + this.hook.refuseW &&
+          g.y >= this.hook.refuseY && g.y < this.hook.refuseY + this.hook.refuseH) {
+        const h = this.hook;
+        this.hook = null;
+        h.onRefuse();
+        return;
+      }
+    }
+
+    // Check ink pad
+    if (g.x >= LAYOUT.PAD_X && g.x < LAYOUT.PAD_X + 32 &&
+        g.y >= LAYOUT.PAD_Y && g.y < LAYOUT.PAD_Y + 20) {
+      void ensureAudio().then(() => reInk());
+      return;
+    }
+
+    // Try grab stamps
     for (const s of this.stamps) {
-      s.setSlots({ targets: this.collectTargets() });
-      if (s.el.style.display === "none") continue;
-      const x = rack.left + 45;
-      const y = rack.top + 40 + i * 96;
-      s.setRest(x, y);
-      i++;
+      if (!s.visible) continue;
+      if (s.tryGrab(g.x, g.y)) return;
     }
   }
 
-  private collectTargets() {
-    const all: ReturnType<typeof layoutStampTargets> = [];
-    for (const d of this.renderedDocs) {
-      all.push(...layoutStampTargets(d, () => 1));
+  private onPointerMove(e: PointerEvent): void {
+    const g = pointerToGrid(this.scene, e.clientX, e.clientY);
+    if (!g) return;
+    for (const s of this.stamps) {
+      s.drag(g.x, g.y);
     }
-    // keep stamps aware of targets
-    for (const s of this.stamps) s.setSlots({ targets: all });
-    return all;
   }
 
-  private syncHud(): void {
-    renderHud(this.refs.hud, store.state);
-    applyBoredom(this.refs.world, store.state.boredom, false);
-    // ink fill visuals
-    const fill = this.refs.pad.querySelector<HTMLElement>(".ink-fill");
-    if (fill) fill.style.height = `${store.state.inkLevel}%`;
+  private onPointerUp(_e: PointerEvent): void {
+    for (const s of this.stamps) {
+      s.release();
+    }
   }
 
-  // --- intro & day flow -------------------------------------------------
+  // ============================ RENDER LOOP ============================
+
+  private tick = (): void => {
+    requestAnimationFrame(this.tick);
+    this.animFrame++;
+
+    // Update stamps
+    for (const s of this.stamps) s.update();
+
+    // Update specks
+    if (this.specks.length > 0) {
+      this.specks = tickSpecks(this.specks);
+    }
+
+    // Update shake
+    if (this.shakeLife > 0) {
+      this.shakeLife--;
+      this.shakeX = Math.round((Math.random() * 2 - 1) * 1);
+      this.shakeY = Math.round((Math.random() * 2 - 1) * 1);
+    } else {
+      this.shakeX = 0;
+      this.shakeY = 0;
+    }
+
+    // Update vivid decay (transgression colour-flood)
+    if (this.vivid01 > 0) {
+      this.vivid01 = Math.max(0, this.vivid01 - 0.02);
+    }
+
+    // Update flash
+    if (this.flashTimer > 0) {
+      this.flashTimer--;
+      if (this.flashTimer === 0) this.flashMsg = null;
+    }
+
+    // Build render state
+    const s = store.state;
+    const boredom01 = Math.min(s.boredom, 100) / 100;
+
+    // Snapshot current documents from the current traveller
+    const documents = this.current ? this.current.documents : [];
+
+    // Build stamp render states
+    const stampStates = this.stamps.filter((st) => st.visible).map((st) => st.getRenderState());
+
+    // Build docSlots for renderCore and stamp targets
+    this.docSlots = [];
+    this.docX = [];
+    this.docY = [];
+    const maxDocs = Math.min(documents.length, 3);
+    for (let i = 0; i < maxDocs; i++) {
+      const dx = LAYOUT.DOC_X + i * (LAYOUT.DOC_W + LAYOUT.DOC_SPACING);
+      const dy = LAYOUT.DOC_Y;
+      this.docX.push(dx);
+      this.docY.push(dy);
+      this.docSlots.push({
+        kind: "APPROVE", x: dx + Math.floor(LAYOUT.DOC_W * 0.65), y: dy + Math.floor(LAYOUT.DOC_H * 0.82),
+        radius: 12, docIndex: i,
+        localX: Math.floor(LAYOUT.DOC_W * 0.65), localY: Math.floor(LAYOUT.DOC_H * 0.82),
+      });
+      this.docSlots.push({
+        kind: "DENY", x: dx + Math.floor(LAYOUT.DOC_W * 0.3), y: dy + Math.floor(LAYOUT.DOC_H * 0.82),
+        radius: 12, docIndex: i,
+        localX: Math.floor(LAYOUT.DOC_W * 0.3), localY: Math.floor(LAYOUT.DOC_H * 0.82),
+      });
+    }
+
+    // Update stamp targets
+    const targets: StampTarget[] = this.docSlots.map((slot) => ({
+      kind: slot.kind,
+      x: slot.x, y: slot.y, radius: slot.radius,
+      docIndex: slot.docIndex,
+      docX: this.docX[slot.docIndex] ?? 0,
+      docY: this.docY[slot.docIndex] ?? 0,
+      localX: slot.localX, localY: slot.localY,
+    }));
+    for (const st of this.stamps) st.setTargets(targets);
+
+    // Activate palette
+    this.ctx.packed = activePalette(boredom01, this.vivid01);
+
+    // Render
+    const rs: RC.RenderState = {
+      boredom01,
+      vivid01: this.vivid01,
+      inkLevel: s.inkLevel,
+      current: this.current,
+      documents,
+      docSlots: this.docSlots,
+      stamps: stampStates,
+      rulebook: this.rulebook,
+      world: s,
+      animFrame: this.animFrame,
+      travelerAnimT: 0,
+      flashMsg: this.flashTimer > 0 ? this.flashMsg : null,
+      pointer: null,
+      modal: this.modal ? { title: this.modal.title, body: this.modal.body, btn: this.modal.btn } : null,
+      hitboxes: [],
+    };
+
+    RC.render(this.ctx, rs);
+
+    // Draw specks on top
+    drawSpecks(this.ctx, this.specks);
+
+    // Apply shake by offsetting the final blit
+    if (this.shakeX !== 0 || this.shakeY !== 0) {
+      // Simple approach: copy a shifted version of the framebuffer
+      this.scene.ctx.putImageData(this.scene.imgData, this.shakeX, this.shakeY);
+    } else {
+      flip(this.scene);
+    }
+  };
+
+  // ============================ GAME FLOW ============================
 
   private openIntro(day: number): void {
     const rule = getRulebook(day);
     const intro =
       day === 1
-        ? "Morning. The booth is cold, the lamp hums, and the queue is already forming. Another day of stamps and silence. Try to stay awake."
-        : `Day ${day}. ${rule.amendment ? rule.amendment : "No new rules today — just the same old ones, repeating."} The queue shuffles closer.`;
-    this.scene("Morning Briefing", intro, "Open the booth", () => {
+        ? "MORNING. THE BOOTH IS COLD. THE LAMP HUMS. ANOTHER DAY OF STAMPS AND SILENCE. STAY AWAKE IF YOU CAN."
+        : `DAY ${day}. ${rule.amendment ? rule.amendment.toUpperCase() : "NO NEW RULES. THE SAME ONES REPEAT."} THE QUEUE MOVES.`;
+    this.setModal("MORNING BRIEFING", intro, "OPEN BOOTH", () => {
       this.startDay(day);
     });
   }
 
-  private scene(title: string, body: string, btn: string, after: () => void): void {
-    const overlay = this.refs.overlay;
-    overlay.classList.remove("hidden");
-    overlay.classList.add("scene");
-    overlay.innerHTML = `
-      <div class="scene-paper">
-        <h1>${title}</h1>
-        <p class="scene-body">${body}</p>
-        <button id="scene-ok">${btn}</button>
-      </div>
-    `;
-    document.getElementById("scene-ok")!.addEventListener("click", () => {
-      overlay.classList.add("hidden");
-      overlay.classList.remove("scene");
-      after();
-    });
+  private setModal(title: string, body: string, btn: string, onConfirm: () => void): void {
+    // Calculate button hitbox for a 200×80 modal centred
+    const pw = 200, ph = 80;
+    const px2 = Math.floor((FB_W - pw) / 2);
+    const py2 = Math.floor((FB_H - ph) / 2);
+    const btnW = Math.max(40, btn.length * 6 + 8);
+    const btnX = px2 + Math.floor((pw - btnW) / 2);
+    const btnY = py2 + ph - 14;
+    this.modal = { title, body, btn, onConfirm, btnX, btnY, btnW, btnH: 10 };
   }
 
   private startDay(day: number): void {
@@ -147,8 +320,7 @@ export class Game {
       s.noticedToday = [];
       s.letSlipToday = [];
     });
-    this.prevDay = day - 1;
-    renderRulebook(this.refs.rulebook, day, this.prevDay);
+    this.rulebook = getRulebook(day);
     this.nextTraveler();
   }
 
@@ -166,23 +338,7 @@ export class Game {
   }
 
   private presentTraveler(t: Traveler): void {
-    // clear tray
-    this.refs.tray.innerHTML = "";
-    this.renderedDocs = [];
-    // dialogue
-    this.refs.dialogue.innerHTML = `<div class="portrait">${t.portrait}</div><div class="line"><b>${t.name}</b>: ${t.line}</div>`;
-
-    // render each document
-    t.documents.forEach((d, i) => {
-      const r = renderDocument(d, i);
-      this.refs.tray.appendChild(r.el);
-      this.renderedDocs.push(r);
-    });
-
-    // after layout, compute stamp targets
-    requestAnimationFrame(() => this.collectTargets());
-
-    // temptation hook
+    // Check for hooks
     if (t.hook) {
       const decision = shouldShowHook(t, store.state.boredom);
       if (decision.shown) {
@@ -193,84 +349,73 @@ export class Game {
 
   private showHook(t: Traveler): void {
     if (!t.hook) return;
-    const bar = document.createElement("div");
-    bar.className = "hook";
-    bar.innerHTML = `<p>${t.hook.prompt}</p><div class="hook-actions"><button data-act="accept">Accept</button><button data-act="refuse">Refuse</button></div>`;
-    this.refs.dialogue.appendChild(bar);
-    bar.querySelector<HTMLButtonElement>('[data-act="accept"]')!.addEventListener("click", () => {
-      this.hookAcceptedThisEncounter = true;
-      acceptHook(t.hook!, t.regularId ? 14 : 8);
-      this.refs.dialogue.innerHTML += `<div class="line muted">${t.hook!.acceptLine}</div>`;
-      bar.remove();
-      // advance a regular's arc if applicable
-      if (t.regularId) {
-        advanceForRegular(t.regularId, store.state.day);
-        // Forged stamp unlocks via the internal-affairs / forgery_request arc
-        if (t.hook!.kind === "forgery_request") this.unlockForgedStamp();
-      } else {
-        maybeOpenInternalAffairs();
-      }
-      this.colorStab();
-    });
-    bar.querySelector<HTMLButtonElement>('[data-act="refuse"]')!.addEventListener("click", () => {
-      this.refs.dialogue.innerHTML += `<div class="line muted">${t.hook!.refuseLine}</div>`;
-      bar.remove();
-    });
+    const prompt = t.hook.prompt;
+    const hookY = LAYOUT.DLG_Y + 22;
+    this.hook = {
+      prompt,
+      onAccept: () => {
+        this.hookAcceptedThisEncounter = true;
+        acceptHook(t.hook!, t.regularId ? 14 : 8);
+        if (t.regularId) {
+          advanceForRegular(t.regularId, store.state.day);
+          if (t.hook!.kind === "forgery_request") this.unlockForgedStamp();
+        } else {
+          maybeOpenInternalAffairs();
+        }
+        this.colorStab();
+      },
+      onRefuse: () => {
+        // Just clear the hook; the traveler is still pending a stamp
+      },
+      acceptX: 200, acceptY: hookY, acceptW: 36, acceptH: 8,
+      refuseX: 242, refuseY: hookY, refuseW: 36, refuseH: 8,
+    };
   }
 
   private unlockForgedStamp(): void {
     const forged = this.stamps.find((s) => s.kind === "FORGED");
-    if (forged && forged.el.style.display === "none") {
-      forged.el.style.display = "";
-      forged.el.classList.add("just-unlocked");
-      this.layoutStamps();
-      this.scene(
-        "An Illicit Stamp",
-        "A small, cold stamp slides under the glass with no return address. It reads FORGE. You shouldn't have it. You keep it anyway. Drag it onto any document to leave a mark the rulebook never authorised — at a cost.",
-        "Hide it in the drawer",
+    if (forged && !forged.visible) {
+      forged.visible = true;
+      this.setModal(
+        "AN ILLICIT STAMP",
+        "A COLD STAMP SLIDES UNDER THE GLASS. IT READS FORGE. YOU SHOULDNT HAVE IT. DRAG IT ONTO ANY DOCUMENT TO LEAVE A MARK THE RULEBOOK NEVER AUTHORIZED.",
+        "HIDE IT",
         () => {}
       );
     }
   }
 
   private colorStab(): void {
-    applyBoredom(this.refs.world, store.state.boredom, true);
-    // a small music sting via the APPROVE pledge, harder & quick
+    this.vivid01 = 1; // full colour flood
     playStamp("APPROVE", false);
   }
 
-  // --- stamp impact → verdict resolution --------------------------------
+  // ============================ STAMP IMPACT ============================
 
-  private onStampImpact(info: {
-    kind: StampKind;
-    screenX: number;
-    screenY: number;
-    hit: boolean;
-    target?: StampTarget;
-  }): void {
+  private onStampImpact(info: StampImpactInfo): void {
     const usedForged = info.kind === "FORGED";
-    // imprint (with current ink fraction)
     const frac = inkFraction();
+
+    // Draw imprint at the target location on the framebuffer
     if (info.target) {
-      imprintAt(info.target, frac, info.kind);
+      drawImprint(this.ctx, info.x, info.y, { kind: info.kind, inkLevel: frac });
     }
-    // consume ink + play layered sound
+
+    // Consume ink + play sound
     consumeInk(INK_PER_STAMP);
     playStamp(info.kind, !usedForged);
-    // recoil + screen shake
-    this.recoil(info.target?.canvas?.closest(".doc") as HTMLElement | null);
-    this.shakeScreen(usedForged ? 4 : 2.5);
-    // ink-particle burst (6–10 specks) at the impact point
-    this.particleBurst(info.screenX, info.screenY, info.kind);
 
-    // resolve verdict
+    // Impact effects: screen shake + specks
+    this.shakeLife = 2;
+    this.specks.push(...spawnSpecks(info.x, info.y, info.kind));
+
+    // Resolve verdict
     const t = this.current;
     if (!t) return;
     const rule = getRulebook(store.state.day);
     const outcome = evaluateAction(t, rule, info.kind, usedForged);
 
-    // advance a regular arc if this was a deliberate betrayal on a regular,
-    // UNLESS the hook was already accepted this encounter (it advanced then)
+    // Advance regular arc if deliberate betrayal on a regular (not via hook)
     if (outcome.transgression && t.regularId && !this.hookAcceptedThisEncounter) {
       const correct = resolveTraveler(t, rule).verdict;
       if ((info.kind === "APPROVE" && correct === "DENY") || usedForged) {
@@ -280,132 +425,68 @@ export class Game {
       maybeOpenInternalAffairs();
     }
 
-    // colour stab on betrayal
+    // Colour stab on betrayal
     if (outcome.transgression) this.colorStab();
 
-    // show resolution line briefly
-    this.flash(outcome.reason);
+    // Flash message
+    this.flashMsg = outcome.reason.toUpperCase().slice(0, 50);
+    this.flashTimer = 90; // ~1.5s at 60fps
 
-    // advance to next traveler (slight delay for impact to land)
-    store.patch((s) => {
-      s.travelerIndex += 1;
-    });
+    // Advance traveler index
+    store.patch((s) => { s.travelerIndex += 1; });
+
+    // Next traveler after a delay
     window.setTimeout(() => {
-      // suspicion-triggered scene comes after the resolution
-      if (maybeTriggerScene(() => this.nextTraveler())) return;
+      this.current = null;
+      const scene = maybeTriggerScene(() => this.nextTraveler());
+      if (scene) {
+        this.setModal(scene.title, scene.body, scene.btn, scene.after);
+        return;
+      }
       this.nextTraveler();
     }, 650);
   }
 
-  private flash(msg: string): void {
-    const f = document.createElement("div");
-    f.className = "flash";
-    f.textContent = msg;
-    this.refs.root.appendChild(f);
-    requestAnimationFrame(() => f.classList.add("show"));
-    window.setTimeout(() => {
-      f.classList.remove("show");
-      window.setTimeout(() => f.remove(), 400);
-    }, 1100);
-  }
-
-  private recoil(doc: HTMLElement | null): void {
-    if (!doc) return;
-    doc.animate(
-      [
-        { transform: "translate(0,0) rotate(0deg)" },
-        { transform: `translate(${rnd(-3, 3)}px, ${rnd(-3, 3)}px) rotate(${rnd(-1, 1)}deg)` },
-        { transform: "translate(0,0) rotate(0deg)" },
-      ],
-      { duration: 90, easing: "ease-out" }
-    );
-  }
-
-  private particleBurst(x: number, y: number, kind: StampKind): void {
-    const colour =
-      kind === "APPROVE" ? "#2f9e44" : kind === "DENY" ? "#c92a2a" : "#5f3dc4";
-    const n = 6 + Math.floor(Math.random() * 5); // 6–10
-    for (let i = 0; i < n; i++) {
-      const s = document.createElement("div");
-      s.className = "ink-speck";
-      s.style.background = colour;
-      const ang = Math.random() * Math.PI * 2;
-      const dist = 14 + Math.random() * 34;
-      const dx = Math.cos(ang) * dist;
-      const dy = Math.sin(ang) * dist - 8; // bias upward slightly
-      s.style.left = `${x}px`;
-      s.style.top = `${y}px`;
-      this.refs.root.appendChild(s);
-      s.animate(
-        [
-          { transform: "translate(-50%,-50%) scale(1)", opacity: 0.9 },
-          { transform: `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(0.2)`, opacity: 0 },
-        ],
-        { duration: 360 + Math.random() * 240, easing: "cubic-bezier(.3,.7,.4,1)" }
-      ).onfinish = () => s.remove();
-    }
-  }
-
-  private shakeScreen(mag: number): void {
-    const world = this.refs.world;
-    let t = 0;
-    const dur = 180;
-    const start = performance.now();
-    const step = () => {
-      const e = performance.now() - start;
-      t = e / dur;
-      if (t >= 1) {
-        world.style.setProperty("--shake-x", "0px");
-        world.style.setProperty("--shake-y", "0px");
-        return;
-      }
-      const decay = 1 - t;
-      world.style.setProperty("--shake-x", `${rnd(-mag, mag) * decay}px`);
-      world.style.setProperty("--shake-y", `${rnd(-mag, mag) * decay}px`);
-      requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  }
+  // ============================ END OF DAY ============================
 
   private endOfDay(): void {
-    // after the last traveler, the shift is done; reset ink for next day
     store.set({ inkLevel: 100 });
     const s = store.state;
     if (s.day >= totalDays()) {
       this.finalDossier();
       return;
     }
-    showDossier(s, () => {
+    // Build dossier text
+    const threads = Object.values(s.threads).filter((t) => t.opened);
+    const susp = s.suspicion;
+    const suspLine =
+      susp < 15 ? "NO ONE IS WATCHING YOU."
+      : susp < 35 ? "A NOTE HAS BEEN TAKEN SOMEWHERE."
+      : susp < 55 ? "THEY ARE WATCHING THE BOOTH."
+      : susp < 75 ? "A GREY COAT LURKS NEARBY."
+      : "YOU HAVE BEEN MARKED.";
+    const noticed = s.noticedToday.length ? s.noticedToday.join(", ").toUpperCase() : "NO ONE IN PARTICULAR.";
+    const letSlip = s.letSlipToday.length ? s.letSlipToday.join(", ").toUpperCase() : "NO ONE. A DULL DAY.";
+    const threadLines = threads.length
+      ? threads.map((t) => `${t.id.toUpperCase()} ${t.resolved ? "RESOLVED" : "OPEN"}`).join(". ")
+      : "NONE OPENED. STILL QUIET.";
+    const body = `${suspLine}\n\nNOTICED: ${noticed}\nLET SLIP: ${letSlip}\n\nTHREADS: ${threadLines}`;
+    this.setModal(`END OF DAY ${s.day}`, body, `BEGIN DAY ${s.day + 1}`, () => {
       this.openIntro(s.day + 1);
     });
   }
 
   private finalDossier(): void {
-    const overlay = this.refs.overlay;
-    overlay.classList.remove("hidden");
-    overlay.classList.add("dossier");
     const s = store.state;
     const arcs = Object.values(s.threads).filter((t) => t.resolved);
-    overlay.innerHTML = `
-      <div class="dossier-paper">
-        <h1>End of Tenure</h1>
-        <p>The week is done. The booth still hums. Somewhere a poster peels. You have made ${arcs.length} ${arcs.length === 1 ? "story" : "stories"} out of a quiet job.</p>
-        <section>
-          <h2>What you'll remember</h2>
-          <ul>${arcs.length ? arcs.map((t) => `<li>${escapeHtml(t.log[t.log.length - 1])}</li>`).join("") : "<li class=\"muted\">Nothing — you kept your head down, and the days were all the same grey.</li>"}</ul>
-        </section>
-        <button id="restart">Begin another week</button>
-      </div>
-    `;
-    document.getElementById("restart")!.addEventListener("click", () => {
-      location.reload();
-    });
+    const arcLines = arcs.length
+      ? arcs.map((t) => t.log[t.log.length - 1]).join(". ")
+      : "NOTHING. YOU KEPT YOUR HEAD DOWN.";
+    this.setModal(
+      "END OF TENURE",
+      `THE WEEK IS DONE. THE BOOTH STILL HUMS.\n\nYOU MADE ${arcs.length} STOR${arcs.length === 1 ? "Y" : "IES"}.\n\n${arcLines.toUpperCase()}`,
+      "AGAIN",
+      () => location.reload()
+    );
   }
-}
-
-function rnd(a: number, b: number): number {
-  return a + Math.random() * (b - a);
-}
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }

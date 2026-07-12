@@ -31,7 +31,7 @@
     "appId": "ai.opencode.idlehands",
     "productName": "Idle Hands",
     "directories": {
-      "output": "dist_electron",
+      "output": "exe_out",
       "buildResources": "electron"
     },
     "files": [

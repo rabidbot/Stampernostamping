@@ -17,12 +17,7 @@ export function inkFraction(): number {
 
 // Re-ink: slow satisfying press onto the pad. Fully restores + plays squelch.
 export function reInk(onDone?: () => void): void {
-  const pad = document.querySelector<HTMLElement>(".ink-pad");
   playSquelch();
-  if (pad) {
-    pad.classList.add("pressing");
-    setTimeout(() => pad.classList.remove("pressing"), 420);
-  }
   // animate fill back up
   const start = store.state.inkLevel;
   const dur = 420;

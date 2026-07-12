@@ -1,124 +1,182 @@
-// imprint.ts — draws a stochastic stamp imprint onto a document canvas.
-// Never pixel-identical twice: rotation jitter, position jitter, radial
-// density falloff, grain mask, opacity variance, occasional ghost double-strike.
-// Ink level (0..1) makes imprints patchier as it drops.
+// imprint.ts — 1-bit pixel stamp imprint on the framebuffer.
+// Hard pixels with dither for faded edges. Low ink = more dropped pixels,
+// never lower opacity. Rotation/position/density jitter + ghost strikes.
+import * as P from "../render/pixel";
+import { PAL } from "../render/palette";
+import { GLYPH_W, GLYPH_H, CHAR_ADVANCE, getGlyph } from "../render/font";
 
-export interface ImprintOptions {
+type StampKind = "APPROVE" | "DENY" | "FORGED";
+
+export interface ImprintOpts {
   kind: "APPROVE" | "DENY" | "FORGED";
-  inkLevel: number; // 1.0 fresh .. 0.0 dry
+  inkLevel: number; // 0..1
 }
 
-const COLOUR: Record<ImprintOptions["kind"], string> = {
-  APPROVE: "#2f9e44",
-  DENY: "#c92a2a",
-  FORGED: "#5f3dc4",
-};
-
-const LABEL: Record<ImpressKindKey, string> = {
+const STAMP_TEXT: Record<ImprintOpts["kind"], string> = {
   APPROVE: "APPROVED",
   DENY: "DENIED",
   FORGED: "FORGED",
 };
-type ImpressKindKey = "APPROVE" | "DENY" | "FORGED";
 
-// Draw the body of a stamp imprint text into a stamp mask ImageData.
-function imprintMask(
-  w: number,
-  h: number,
-  text: string,
-  inkLevel: number
-): ImageData {
-  const off = document.createElement("canvas");
-  off.width = w;
-  off.height = h;
-  const c = off.getContext("2d")!;
-  // draw rounded border ring + label text
-  c.strokeStyle = "#000";
-  c.fillStyle = "#000";
-  c.lineWidth = Math.max(3, w * 0.045);
-  c.strokeRect(6, 6, w - 12, h - 12);
-  c.font = `bold ${Math.round(w * 0.22)}px "Courier New", monospace`;
-  c.textAlign = "center";
-  c.textBaseline = "middle";
-  c.fillText(text, w / 2, h / 2, w - 24);
+const STAMP_COLOUR: Record<ImprintOpts["kind"], number> = {
+  APPROVE: PAL.GRN_M,
+  DENY: PAL.RED_M,
+  FORGED: PAL.FOR_M,
+};
 
-  const src = c.getImageData(0, 0, w, h);
-  // apply radial density falloff + grain
-  const cx = w / 2;
-  const cy = h / 2;
-  const maxR = Math.hypot(cx, cy);
-  const out = c.createImageData(w, h);
-  const feed = inkLevel; // higher = denser
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      const a = src.data[i + 3];
-      if (a < 8) {
-        out.data[i + 3] = 0;
-        continue;
+// Build a 1-bit mask of the stamp shape (border rect + text inside).
+// Returns { w, h, pixels: boolean[] } where true = could be inked.
+function buildMask(text: string): { w: number; h: number; pixels: boolean[] } {
+  const textW = text.length * CHAR_ADVANCE - 1;
+  const padX = 3, padY = 2;
+  const w = Math.max(textW + padX * 2, 20);
+  const h = GLYPH_H + padY * 2 + 4; // border + text + border
+  const pixels = new Array(w * h).fill(false);
+
+  // Border rectangle (2px inset)
+  for (let x = 2; x < w - 2; x++) {
+    pixels[1 * w + x] = true;          // top border
+    pixels[(h - 2) * w + x] = true;    // bottom border
+  }
+  for (let y = 1; y < h - 1; y++) {
+    pixels[y * w + 2] = true;          // left border
+    pixels[y * w + (w - 3)] = true;    // right border
+  }
+
+  // Text inside, centred
+  const textStartX = Math.floor((w - textW) / 2);
+  const textStartY = Math.floor((h - GLYPH_H) / 2);
+  for (let i = 0; i < text.length; i++) {
+    const g = getGlyph(text[i]);
+    for (let row = 0; row < GLYPH_H; row++) {
+      for (let cx = 0; cx < GLYPH_W; cx++) {
+        if (g.data[row][cx] === "#") {
+          const px = textStartX + i * CHAR_ADVANCE + cx;
+          const py = textStartY + row;
+          if (px >= 0 && px < w && py >= 0 && py < h) {
+            pixels[py * w + px] = true;
+          }
+        }
       }
-      const dx = x - cx;
-      const dy = y - cy;
-      const r = Math.hypot(dx, dy) / maxR; // 0..1
-      // radial falloff: heavy centre, feathered edges
-      const radial = Math.max(0, 1 - r * r);
-      // grain
-      const grain = 0.55 + Math.random() * 0.45;
-      // dry ink = more broken
-      const dry = feed < 0.35 ? Math.random() < (0.35 - feed) * 1.8 : false;
-      let alpha = a * radial * grain;
-      if (dry) alpha *= 0.2;
-      out.data[i + 3] = Math.min(255, alpha * (0.75 + feed * 0.25));
     }
   }
-  return out;
+
+  return { w, h, pixels };
 }
 
+// Draw an imprint at (cx, cy) on the framebuffer.
+// ctx is the pixel context, kind/inkLevel define appearance.
 export function drawImprint(
-  ctx: CanvasRenderingContext2D,
+  ctx: P.PixelCtx,
   cx: number,
   cy: number,
-  scale: number,
-  opts: ImprintOptions
+  opts: ImprintOpts
 ): void {
-  const baseW = 150;
-  const baseH = 84;
-  const w = Math.max(20, baseW * scale);
-  const h = Math.max(12, baseH * scale);
-  const rotJitter = (Math.random() * 2 - 1) * 3; // ±3 deg
-  const posJx = (Math.random() * 2 - 1) * 2;
-  const posJy = (Math.random() * 2 - 1) * 2;
-  const opacity = 0.75 + Math.random() * 0.2;
-  const colour = COLOUR[opts.kind];
-  const label = LABEL[opts.kind];
+  const text = STAMP_TEXT[opts.kind];
+  const colIdx = STAMP_COLOUR[opts.kind];
+  const mask = buildMask(text);
 
-  ctx.save();
-  ctx.translate(cx + posJx, cy + posJy);
-  ctx.rotate((rotJitter * Math.PI) / 180);
-  ctx.globalAlpha = opacity * (0.6 + opts.inkLevel * 0.4);
-  ctx.globalCompositeOperation = "source-over";
+  // Rotation jitter ±3°
+  const angle = (Math.random() * 2 - 1) * 3 * Math.PI / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
 
-  const mask = imprintMask(Math.round(w), Math.round(h), label, opts.inkLevel);
-  // colour the mask into a temp canvas so we can composite with the colour
-  const tmp = document.createElement("canvas");
-  tmp.width = mask.width;
-  tmp.height = mask.height;
-  const tctx = tmp.getContext("2d")!;
-  tctx.putImageData(mask, 0, 0);
-  // tint: multiply with the colour by drawing a coloured rect over alpha
-  tctx.globalCompositeOperation = "source-in";
-  tctx.fillStyle = colour;
-  tctx.fillRect(0, 0, tmp.width, tmp.height);
-  ctx.drawImage(tmp, -w / 2, -h / 2);
+  // Position jitter ±2px
+  const jitX = Math.round(Math.random() * 4 - 2);
+  const jitY = Math.round(Math.random() * 4 - 2);
 
-  // occasional ghost double-strike (~25% chance, slight offset, faint)
-  if (Math.random() < 0.25) {
-    ctx.globalAlpha = opacity * 0.25;
-    ctx.drawImage(
-      tmp,
-      -w / 2 + (Math.random() < 0.5 ? 1 : 2),
-      -h / 2 + (Math.random() < 0.5 ? 1 : 2)
-    );
+  // Ink density: higher ink = fewer dropped pixels
+  // At ink 1.0: ~95% inked. At ink 0.2: ~35% inked.
+  const inkP = Math.max(0.25, opts.inkLevel * 0.7 + 0.25);
+
+  // Centre of mask
+  const mcx = mask.w / 2;
+  const mcy = mask.h / 2;
+
+  // Bayer 2×2 for dithered edges
+  const bayer = [[0, 2], [3, 1]];
+
+  // Radial density falloff: centre = 1, edge = 0.3
+  const maxR = Math.hypot(mcx, mcy);
+
+  for (let my = 0; my < mask.h; my++) {
+    for (let mx = 0; mx < mask.w; mx++) {
+      if (!mask.pixels[my * mask.w + mx]) continue;
+
+      // Radial falloff
+      const dx = mx - mcx;
+      const dy = my - mcy;
+      const r = Math.hypot(dx, dy) / maxR;
+      const radial = Math.max(0.2, 1 - r * r * 0.7);
+
+      // Edge dither: pixels near the border of the mask get dithered
+      const isEdge = mx <= 3 || mx >= mask.w - 4 || my <= 2 || my >= mask.h - 3;
+      const ditherThreshold = isEdge ? 0.3 : 0.0;
+      const bv = bayer[(my & 1)][(mx & 1)] / 4;
+
+      // Ink density check
+      const inked = Math.random() < inkP * radial;
+      if (!inked) continue;
+
+      // Edge dither
+      if (ditherThreshold > 0 && bv < ditherThreshold) continue;
+
+      // Rotate + translate to screen
+      const rx = Math.round((mx - mcx) * cos - (my - mcy) * sin + cx + jitX);
+      const ry = Math.round((mx - mcx) * sin + (my - mcy) * cos + cy + jitY);
+
+      P.px(ctx, rx, ry, colIdx);
+    }
   }
-  ctx.restore();
+
+  // Ghost strike: ~25% chance, offset 1-2px, ~25% of pixels
+  if (Math.random() < 0.25) {
+    const gx = Math.round(Math.random() * 2 - 1);
+    const gy = Math.round(Math.random() * 2 - 1);
+    for (let my = 0; my < mask.h; my++) {
+      for (let mx = 0; mx < mask.w; mx++) {
+        if (!mask.pixels[my * mask.w + mx]) continue;
+        if (Math.random() > 0.25) continue;
+        const rx = Math.round((mx - mcx) * cos - (my - mcy) * sin + cx + jitX + gx);
+        const ry = Math.round((mx - mcx) * sin + (my - mcy) * cos + cy + jitY + gy);
+        P.px(ctx, rx, ry, colIdx);
+      }
+    }
+  }
+}
+
+// Particle burst: 4-6 single-pixel specks that pop and vanish quickly.
+// Returns an array of particles to be tracked by the game loop.
+export interface Speck { x: number; y: number; dx: number; dy: number; life: number; col: number; }
+
+export function spawnSpecks(cx: number, cy: number, kind: StampKind): Speck[] {
+  const col = kind === "APPROVE" ? PAL.GRN_L : kind === "DENY" ? PAL.RED_L : PAL.FOR_L;
+  const n = 4 + Math.floor(Math.random() * 3); // 4-6
+  const specks: Speck[] = [];
+  for (let i = 0; i < n; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const dist = 2 + Math.random() * 3;
+    specks.push({
+      x: cx, y: cy,
+      dx: Math.round(Math.cos(ang) * dist),
+      dy: Math.round(Math.sin(ang) * dist - 1),
+      life: 3, // 3 frames
+      col,
+    });
+  }
+  return specks;
+}
+
+export function drawSpecks(ctx: P.PixelCtx, specks: Speck[]): void {
+  for (const s of specks) {
+    if (s.life > 0) {
+      const px2 = s.x + Math.round((3 - s.life) / 3 * s.dx);
+      const py2 = s.y + Math.round((3 - s.life) / 3 * s.dy);
+      P.px(ctx, px2, py2, s.col);
+    }
+  }
+}
+
+export function tickSpecks(specks: Speck[]): Speck[] {
+  return specks.map((s) => ({ ...s, life: s.life - 1 })).filter((s) => s.life > 0);
 }

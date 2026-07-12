@@ -1,273 +1,207 @@
-// stamp.ts — the stamp as a draggable physical object with weight, snap, slam.
-// Crown jewel. Builds the interaction: grab → drag with inertia → magnetic snap
-// to a valid slot → wind-up → SLAM (ease-out-back, overshoot, settle) → impact.
-import { drawImprint } from "./imprint";
+// stamp.ts — pixel-grid stamp. Drag with weight/lag, quantized to integer
+// grid. Stepped 3-frame slam: raised → mid → SLAMMED → settle.
+// No easing. No DOM. Pure grid-space animation for the canvas renderer.
 
 export type StampKind = "APPROVE" | "DENY" | "FORGED";
 
-export interface StampSlots {
-  // screen-space rects of valid stamp targets on the current document,
-  // each tagged with its kind and the doc canvas + local centre to draw at.
-  targets: StampTarget[];
-}
-
 export interface StampTarget {
-  kind: StampKind;
-  // slot centre in screen coords (for snap)
-  screenX: number;
-  screenY: number;
-  // the document canvas to imprint on
-  canvas: HTMLCanvasElement;
-  // centre of the slot in canvas-local coords
-  localX: number;
-  localY: number;
-  // width of the slot (for snap radius)
-  radius: number;
+  kind: StampKind;       // which stamp snaps here
+  x: number; y: number;   // grid coords of slot centre
+  radius: number;          // snap radius in grid px
+  docIndex: number;
+  // for imprint: the doc's top-left + the slot centre relative to it
+  docX: number; docY: number;
+  localX: number; localY: number;
 }
 
 export interface StampImpactInfo {
   kind: StampKind;
-  screenX: number;
-  screenY: number;
-  // whether the stamp landed on a matching valid target
-  hit: boolean;
-  target?: StampTarget;
+  x: number; y: number;     // impact position in grid coords
+  target: StampTarget | null;
 }
 
-export class Stamp {
-  readonly el: HTMLDivElement;
+export class PixelStamp {
   kind: StampKind;
-  inkConsume = () => 8; // amount consumed per stamp; overridden by ink economy
+  restX: number; restY: number;  // resting position on the rack
+  x: number; y: number;           // render position (quantized integers)
+  grabbed = false;
+  hovering = false;
+  slamming = false;
+  frame = 0;   // slam animation frame
+  visible = true;
   onImpact: (info: StampImpactInfo) => void = () => {};
 
-  private dragging = false;
-  private pointerX = 0;
-  private pointerY = 0;
-  private x = 0;
-  private y = 0;
-  private vx = 0;
-  private vy = 0;
-  private scale = 1;
-  private shadow = 6;
-  private targetScale = 1;
-  private targetShadow = 6;
-  private grabbing = false;
+  private px = 0;  // pointer (may be fractional for lag)
+  private py = 0;
+  private lx = 0;  // lagged (pre-quantize)
+  private ly = 0;
+  private slamTarget: StampTarget | null = null;
+  private slamTick = 0;
+  private targets: StampTarget[] = [];
 
-  // animation state machine: "idle" | "ready" | "winding" | "slamming"
-  private phase: "idle" | "ready" | "winding" | "slamming" = "idle";
-  private phaseT = 0;
-  private slamFromY = 0;
-  private slamToY = 0;
-
-  private slots: StampSlots = { targets: [] };
-  private hovered: StampTarget | null = null;
-
-  private raf = 0;
-
-  constructor(kind: StampKind, label: string, colour: string) {
+  constructor(kind: StampKind, restX: number, restY: number) {
     this.kind = kind;
-    const el = document.createElement("div");
-    el.className = "stamp";
-    el.dataset.kind = kind;
-    el.innerHTML = `<div class="stamp-handle"></div><div class="stamp-head" style="--c:${colour}">${label}</div>`;
-    this.el = el;
-    this.bind();
-    this.loop();
+    this.restX = restX;
+    this.restY = restY;
+    this.x = restX;
+    this.y = restY;
+    this.lx = restX;
+    this.ly = restY;
+    this.px = restX;
+    this.py = restY;
   }
 
-  setSlots(slots: StampSlots): void {
-    this.slots = slots;
+  setTargets(targets: StampTarget[]): void {
+    this.targets = targets;
   }
 
-  mount(container: HTMLElement, x: number, y: number): void {
-    container.appendChild(this.el);
-    this.x = x;
-    this.y = y;
-    this.pointerX = x;
-    this.pointerY = y;
-    this.apply();
+  // Called on pointer-down if the pointer is near the stamp.
+  tryGrab(gx: number, gy: number): boolean {
+    const dx = Math.abs(gx - this.x);
+    const dy = Math.abs(gy - this.y);
+    if (dx <= 10 && dy <= 12) {
+      this.grabbed = true;
+      this.px = gx;
+      this.py = gy;
+      return true;
+    }
+    return false;
   }
 
-  // teleport the stamp to a rest position on the rack (no drag inertia).
-  setRest(x: number, y: number): void {
-    this.x = x;
-    this.y = y;
-    this.pointerX = x;
-    this.pointerY = y;
-    this.apply();
+  // Called on pointer-move while grabbing is possible.
+  drag(gx: number, gy: number): void {
+    if (!this.grabbed) return;
+    this.px = gx;
+    this.py = gy;
   }
 
-  private bind(): void {
-    const el = this.el;
-    el.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
-      (e.target as Element).setPointerCapture?.(e.pointerId);
-      this.dragging = true;
-      this.grabbing = true;
-      this.pointerX = e.clientX;
-      this.pointerY = e.clientY;
-      this.targetScale = 1.08;
-      this.targetShadow = 22;
-      el.classList.add("grabbed");
-    });
-    el.addEventListener("pointermove", (e) => {
-      if (!this.dragging) return;
-      this.pointerX = e.clientX;
-      this.pointerY = e.clientY;
-    });
-    const release = (e: PointerEvent) => {
-      if (!this.dragging) return;
-      this.dragging = false;
-      this.grabbing = false;
-      (e.target as Element).releasePointerCapture?.(e.pointerId);
-      el.classList.remove("grabbed");
-      // if hovering a valid target, slam
-      if (this.hovered) {
-        this.beginSlam(this.hovered);
-      } else {
-        this.targetScale = 1;
-        this.targetShadow = 6;
-      }
-    };
-    el.addEventListener("pointerup", release);
-    el.addEventListener("pointercancel", release);
+  // Called on pointer-up.
+  release(): void {
+    if (!this.grabbed) return;
+    this.grabbed = false;
+    // if hovering a target → begin slam
+    if (this.hovering) {
+      this.slamming = true;
+      this.slamTarget = this.hoveringTarget;
+      this.slamTick = 0;
+      this.frame = 0;
+    }
   }
 
-  private beginSlam(target: StampTarget): void {
-    this.phase = "winding";
-    this.phaseT = 0;
-    // snap to slot centre X, but hold Y for the wind-up
-    this.pointerX = target.screenX;
-    this.pointerY = target.screenY;
-    this.slamFromY = target.screenY - 8; // start a touch higher (wind-up)
-    this.slamToY = target.screenY;
-    this.targetScale = 1.12; // wind-up lifts higher
-    this.targetShadow = 26;
-    this._slamTarget = target;
-  }
-  private _slamTarget: StampTarget | null = null;
+  private hoveringTarget: StampTarget | null = null;
 
-  private finishSlam(): void {
-    const target = this._slamTarget;
-    this.phase = "idle";
-    this._slamTarget = null;
-    this.targetScale = 1;
-    this.targetShadow = 6;
-    if (!target) return;
-    // squash 1-frame
-    this.scale = 0.9;
-    // impact!
-    const hit = target.kind === this.kind;
-    this.onImpact({
-      kind: this.kind,
-      screenX: target.screenX,
-      screenY: target.screenY,
-      hit,
-      target,
-    });
-  }
+  // Update — call every frame (60fps). Internally steps the slam at ~15fps.
+  update(): void {
+    if (this.slamming) {
+      this.updateSlam();
+      return;
+    }
 
-  private loop = (): void => {
-    this.raf = requestAnimationFrame(this.loop);
-    this.step();
-    this.apply();
-  };
+    // Lag: lerp toward pointer with weight
+    const follow = this.grabbed ? 0.28 : 0.15;
+    this.lx += (this.px - this.lx) * follow;
+    this.ly += (this.py - this.ly) * follow;
 
-  private step(): void {
-    // weight / inertia: lerp x,y toward pointer with lag
-    const follow = 0.22;
-    const dx = this.pointerX - this.x;
-    const dy = this.pointerY - this.y;
-    this.vx = dx * follow;
-    this.vy = dy * follow;
-    this.x += this.vx;
-    this.y += this.vy;
+    // If not grabbed,弹簧 back to rest
+    if (!this.grabbed) {
+      this.px += (this.restX - this.px) * 0.12;
+      this.py += (this.restY - this.py) * 0.12;
+    }
 
-    // hover detection when dragging & not slamming
-    this.hovered = null;
-    if (this.dragging && this.phase === "idle") {
+    // Quantize to integer grid
+    this.x = Math.round(this.lx);
+    this.y = Math.round(this.ly);
+
+    // Hover detection when grabbed
+    this.hovering = false;
+    this.hoveringTarget = null;
+    if (this.grabbed) {
       let best: StampTarget | null = null;
       let bestD = Infinity;
-      for (const t of this.slots.targets) {
-        // FORGED snaps to any slot; APPROVE/DENY only to their matching slot
+      for (const t of this.targets) {
+        // FORGED snaps to any kind; APPROVE/DENY to their own
         if (this.kind !== "FORGED" && t.kind !== this.kind) continue;
-        const d = Math.hypot(t.screenX - this.x, t.screenY - this.y);
+        const d = Math.hypot(t.x - this.x, t.y - this.y);
         if (d < t.radius && d < bestD) {
           best = t;
           bestD = d;
         }
       }
       if (best) {
-        this.hovered = best;
-        // magnetic pull toward slot centre
-        const pull = 0.3;
-        this.pointerX += (best.screenX - this.pointerX) * pull;
-        this.pointerY += (best.screenY - this.pointerY) * pull;
-        this.targetScale = 1.05;
-        // eager downward wobble: small sin jitter on Y
-        this.y += Math.sin(performance.now() / 60) * 0.6;
-      } else {
-        this.targetScale = this.grabbing ? 1.08 : 1;
+        this.hovering = true;
+        this.hoveringTarget = best;
+        // Magnetic pull
+        this.px += (best.x - this.px) * 0.35;
+        this.py += (best.y - this.py) * 0.35;
       }
     }
+  }
 
-    // phase animation
-    if (this.phase === "winding") {
-      this.phaseT += 1;
-      // wind-up: ~2 frames lift higher
-      this.y = this.slamFromY - this.phaseT * 1.2;
-      if (this.phaseT >= 2) {
-        this.phase = "slamming";
-        this.phaseT = 0;
+  private updateSlam(): void {
+    // 3-frame slam at ~15fps (every 4 ticks at 60fps)
+    // Frame 0: raised (1px up)   ticks 0-3
+    // Frame 1: mid (travel down) ticks 4-7
+    // Frame 2: SLAMMED (squash)  ticks 8-11 → fire impact
+    // Frame 3: settle             ticks 12-15 → return to rest
+    this.slamTick++;
+
+    const t = this.slamTarget;
+
+    if (this.slamTick <= 4) {
+      this.frame = 0; // raised
+      if (t) {
+        this.px = t.x;
+        this.lx = t.x;
+        this.ly = t.y - 2; // raised 2px
       }
-    } else if (this.phase === "slamming") {
-      // ease-out-back from slamFromY to slamToY over ~120ms (~7 frames @60fps)
-      this.phaseT += 1;
-      const dur = 7;
-      const t = Math.min(this.phaseT / dur, 1);
-      // ease-out-back with overshoot
-      const c1 = 1.70158;
-      const c3 = c1 + 1;
-      const e = 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
-      this.y = this.slamFromY + (this.slamToY - this.slamFromY) * e;
-      this.targetScale = 1.12 - 0.18 * t; // settle scale toward 0.94 (squash) at impact
-      if (t >= 1) {
-        this.finishSlam();
+    } else if (this.slamTick <= 8) {
+      this.frame = 1; // mid (travel)
+      if (t) {
+        this.ly = t.y - 1;
       }
+    } else if (this.slamTick <= 12) {
+      this.frame = 2; // SLAMMED (squash)
+      if (t) {
+        this.ly = t.y + 1; // squash down
+      }
+      // Fire impact once at frame 2 entry
+      if (this.slamTick === 9) {
+        this.onImpact({
+          kind: this.kind,
+          x: Math.round(t ? t.x : this.lx),
+          y: Math.round(t ? t.y : this.ly),
+          target: this.slamTarget,
+        });
+      }
+    } else if (this.slamTick <= 16) {
+      this.frame = 3; // settle
+      if (t) {
+        this.ly = t.y;
+      }
+    } else {
+      // Done — return to rest
+      this.slamming = false;
+      this.slamTarget = null;
+      this.frame = 0;
+      this.px = this.restX;
+      this.py = this.restY;
+      this.lx = this.restX;
+      this.ly = this.restY;
     }
 
-    // smooth scale/shadow
-    this.scale += (this.targetScale - this.scale) * 0.25;
-    this.shadow += (this.targetShadow - this.shadow) * 0.25;
+    this.x = Math.round(this.lx);
+    this.y = Math.round(this.ly);
   }
 
-  private apply(): void {
-    const el = this.el;
-    el.style.transform = `translate3d(${this.x}px, ${this.y}px, 0) translate(-50%, -50%) scale(${this.scale.toFixed(
-      3
-    )})`;
-    el.style.filter = `drop-shadow(0 ${this.shadow}px ${this.shadow * 1.6}px rgba(0,0,0,0.45))`;
-    el.classList.toggle("hovering", !!this.hovered && this.dragging);
-    el.classList.toggle("slamming", this.phase === "slamming" || this.phase === "winding");
+  getRenderState() {
+    return {
+      kind: this.kind,
+      x: this.x,
+      y: this.y,
+      grabbed: this.grabbed,
+      hovering: this.hovering,
+      slamming: this.slamming,
+      frame: this.frame,
+    };
   }
-
-  destroy(): void {
-    cancelAnimationFrame(this.raf);
-    this.el.remove();
-  }
-}
-
-// Helper to imprint onto a target's canvas (called by the game on impact).
-// `kind` is the stamp's kind (so a FORGED stamp leaves a FORGED imprint
-// even though it landed on an APPROVE/DENY slot).
-export function imprintAt(
-  target: StampTarget,
-  inkLevel: number, // 0..1
-  kind: StampKind
-): void {
-  const ctx = target.canvas.getContext("2d")!;
-  drawImprint(ctx, target.localX, target.localY, 1, {
-    kind,
-    inkLevel,
-  });
 }
