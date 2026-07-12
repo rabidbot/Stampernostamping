@@ -4,20 +4,55 @@
   "version": "1.0.0",
   "type": "module",
   "description": "A document-inspection idle game where boredom is the antagonist and betrayal is the content.",
+  "main": "electron/main.cjs",
+  "author": "opencode",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "electron": "electron .",
+    "dist:win": "vite build && electron-builder --win --x64",
+    "start:exe": "npm run build && npm run electron"
   },
   "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
     "typescript": "^5.4.5",
     "vite": "^5.2.0",
     "vitest": "^1.5.0"
   },
   "dependencies": {
     "tone": "^14.8.49"
+  },
+  "build": {
+    "appId": "ai.opencode.idlehands",
+    "productName": "Idle Hands",
+    "directories": {
+      "output": "dist_electron",
+      "buildResources": "electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "artifactName": "IdleHand.${ext}",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "portable": {
+      "artifactName": "IdleHand.exe"
+    }
   }
 }
