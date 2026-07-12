@@ -26,7 +26,7 @@ export function buildBooth(): BoothRefs {
           <div class="window"></div>
         </div>
         <div class="desk">
-          <div class="rulebook-pane">
+          <div class="rulebook-pane" id="rulebook">
             <h2>Rulebook <span class="daytab">Day <b id="daynum">1</b></span></h2>
             <ol id="rulelist"></ol>
           </div>
